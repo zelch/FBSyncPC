@@ -187,8 +187,8 @@ sub update_book_local {
 sub to_remote {
 	my ($book, $item) = @_;
 	if (defined($book->{$item})) {
-		my $line = uri_escape($book->{$item});
-		$line =~ s/%20/+/g;
+		my $line = uri_escape($book->{$item}, '^a-zA-Z0-9._* -');
+		$line =~ s/ /+/g;
 
 		return $line;
 	}
