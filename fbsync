@@ -1,0 +1,238 @@
+#! /usr/bin/perl
+use strict;
+use DBI;
+use LWP;
+use LWP::UserAgent;
+use Data::Dumper;
+use URI::Escape;
+use File::HomeDir;
+use File::Spec;
+use Config::Std;
+use warnings;
+
+my $conf_file;
+my $fbreader_dir;
+
+for my $base (File::HomeDir->my_home, File::HomeDir->my_documents) {
+	next if (!defined($base));
+	$fbreader_dir = File::Spec->catdir($base, ".FBReader");
+	if (-d $fbreader_dir) {
+		$conf_file = File::Spec->catfile($fbreader_dir, "sync.conf");
+		last;
+	}
+}
+
+if (!defined($conf_file) || ! -f $conf_file) {
+	if (defined($conf_file)) {
+		print STDERR "Error, config file '$conf_file' does not exist.\n";
+	} else {
+		print STDERR "Unable to locate a .FBReader directory, run FBReader on a book, or if that fails contact the developer.\n";
+	}
+	exit(1);
+}
+read_config $conf_file => my %conf;
+
+my $ua = LWP::UserAgent->new;
+$ua->agent("FBSync PC/0.1");
+
+my $books_db = DBI->connect("dbi:SQLite:dbname=$fbreader_dir/books.db", "", "", { AutoCommit => 1, RaiseError => 1, sqlite_see_if_its_a_number => 1}) or die ("Unable to open books DB: $!");
+my $state_db = DBI->connect("dbi:SQLite:dbname=$fbreader_dir/state.db", "", "", { AutoCommit => 1, RaiseError => 1, sqlite_see_if_its_a_number => 1}) or die ("Unable to open state DB: $!");
+
+my %local_books;
+
+my $local_books = get_local_books();
+my $remote_books = get_remote_books();
+
+for my $key (keys(%$local_books)) {
+	next if (!exists($remote_books->{$key}));
+
+	my $local = $local_books->{$key};
+	my $remote = $remote_books->{$key};
+
+	my $local_updated = 0;
+
+	my %num_fields = (recentindex => 1, paragraph => 1, word => 1, char => 1, size => 1);
+	for my $x (keys(%$local)) {
+		if (!defined($local->{$x})) {
+#			print "Field '$x' undefined for local version of '$key'!\n";
+			if ($num_fields{$x}) {
+				$local->{$x} = 0;
+			} else {
+				$local->{$x} = "";
+			}
+		}
+	}
+	for my $x (keys(%$remote)) {
+		if (!defined($remote->{$x})) {
+			print "Field '$x' undefined for remote version of '$key'!\n";
+			if ($num_fields{$x}) {
+				$remote->{$x} = 0;
+			} else {
+				$remote->{$x} = "";
+			}
+		}
+	}
+
+	if ($local->{paragraph} < $remote->{paragraph}) {
+		$local->{paragraph} = $remote->{paragraph};
+		$local->{word} = $remote->{word};
+		$local->{char} = $remote->{char};
+		$local_updated = 1;
+	} elsif ($local->{paragraph} == $remote->{paragraph} && $local->{word} < $remote->{word}) {
+		$local->{word} = $remote->{word};
+		$local->{char} = $remote->{char};
+		$local_updated = 1;
+	} elsif ($local->{paragraph} == $remote->{paragraph} && $local->{word} == $remote->{word} && $local->{char} < $remote->{char}) {
+		$local->{char} = $remote->{char};
+		$local_updated = 1;
+	}
+
+	if ($local_updated) {
+		update_book_local($local);
+	}
+}
+
+for my $key (keys(%$local_books)) {
+	$remote_books->{$key} = $local_books->{$key};
+}
+
+#print(Dumper($local_books));
+send_remote_books($remote_books);
+#print(Dumper($remote_books));
+
+sub get_account_key {
+	return undef if (!exists($conf{WEB}));
+
+	my $req = HTTP::Request->new(POST => $conf{WEB}->{URL} . '/getaccountkey.php');
+	$req->content_type('application/x-www-form-urlencoded');
+	$req->content('email=' . $conf{WEB}->{USER} . '&pin=' . $conf{WEB}->{PIN});
+	my $res = $ua->request($req);
+	if ($res->is_success) {
+		if ($res->content() =~ /^SUCCESS\^(\d*)$/) {
+			return $1;
+		} else {
+			die "Invalid User or PIN.\n";
+		}
+	} else {
+		die "Unable to get account key: " . $res->status_line . "\n";
+	}
+
+	return undef;
+}
+
+sub get_local_books {
+	my $books = $books_db->selectall_hashref(
+		"select file.name || '||' || file.size as key, book.book_id, book.title, book.language, book.encoding, file.name, file.size, parent.name as parent_name FROM
+		 books book, files file, files parent WHERE
+		 file.file_id = book.file_id AND
+		 parent.file_id = file.parent_id",
+		"key", { Slice => {}});
+
+	my $book_hash;
+
+	for my $key (keys(%$books)) {
+		my $entry = $books->{$key};
+		my $tmp = $state_db->selectall_arrayref(
+			"select stack.paragraph, stack.word, stack.char, position.stack_pos AS recentindex FROM BookStateStack stack, StackPosition position WHERE
+			 stack.book_id = position.book_id AND stack.book_id = ? AND stack.position = 0", { Slice => {} }, $entry->{book_id});
+		next if (scalar @$tmp <= 0);
+		for my $x (keys(%{$tmp->[0]})) {
+			$entry->{$x} = $tmp->[0]->{$x};
+		}
+		$book_hash->{"$key"} = $entry;
+	}
+
+	return $book_hash;
+}
+
+
+sub get_remote_books {
+	return undef if (!exists($conf{WEB}));
+
+	my $account_key = get_account_key();
+	my $req = HTTP::Request->new(POST => $conf{WEB}->{URL} . '/getbooks.php');
+	$req->content_type('application/x-www-form-urlencoded');
+	$req->content('accountkey=' . $account_key);
+	my $res = $ua->request($req);
+	if ($res->is_success) {
+		my @rem_books = split(/\|/, $res->content());
+		my $book_hash;
+		foreach my $line (@rem_books) {
+			my $book;
+			($book->{name}, $book->{paragraph}, $book->{word}, $book->{char}, $book->{recentindex}, $book->{encoding}, $book->{language}, $book->{title}, $book->{size}, $book->{parent_name}) = split(/\^/, $line);
+			for my $x (keys(%$book)) {
+				$book->{$x} =~ s/\+/ /g;
+				$book->{$x} = uri_unescape($book->{$x});
+			}
+			$book_hash->{"$book->{name}||$book->{size}"} = $book;
+		}
+
+		return $book_hash;
+
+	} else {
+		die "Unable to get books: " . $res->status_line . "\n";
+	}
+
+}
+
+sub update_book_local {
+	my ($book) = @_;
+	print "\nPushing from remote to local:\n";
+
+	my $rows = $state_db->do("update BookStateStack set paragraph = ?, word = ?, char = ? where book_id = ? and position = 0", {}, $book->{paragraph}, $book->{word}, $book->{char}, $book->{book_id}) or die $state_db->errstr;
+
+	print "Updated $rows records for '$book->{name}'\n";
+}
+
+sub to_remote {
+	my ($book, $item) = @_;
+	if (defined($book->{$item})) {
+		my $line = uri_escape($book->{$item});
+		$line =~ s/%20/+/g;
+
+		return $line;
+	}
+
+	my %num_fields = (recentindex => 1, paragraph => 1, word => 1, char => 1, size => 1);
+	return 0 if ($num_fields{$item});
+	return "";
+}
+
+sub send_remote_books {
+	my ($remote_books) = @_;
+
+	my $data = "";
+	for my $key (keys(%$remote_books)) {
+		my $remote = $remote_books->{$key};
+
+		$data .= to_remote($remote, 'title') . "^";
+		$data .= to_remote($remote, 'name') . "^";
+		$data .= to_remote($remote, 'paragraph') . "^";
+		$data .= to_remote($remote, 'word') . "^";
+		$data .= to_remote($remote, 'char') . "^";
+		$data .= to_remote($remote, 'recentindex') . "^";
+		$data .= to_remote($remote, 'size') . "^";
+		$data .= to_remote($remote, 'encoding') . "^";
+		$data .= to_remote($remote, 'language') . "^";
+		$data .= to_remote($remote, 'parent_name') . "^";
+		$data .= "|";
+	}
+
+	if ($data ne "") {
+		return undef if (!exists($conf{WEB}));
+
+		my $account_key = get_account_key();
+		my $req = HTTP::Request->new(POST => $conf{WEB}->{URL} . '/addbook.php');
+
+		$data = uri_escape($data);
+		$req->content_type('application/x-www-form-urlencoded');
+		$req->content('email=' . $conf{WEB}->{USER} . '&pin=' . $conf{WEB}->{PIN} . '&accountkey=' . $account_key . '&data=' . $data);
+		my $res = $ua->request($req);
+		if ($res->is_success) {
+			print "Successfully pushed books to server.\n";
+			print $res->content;
+		} else {
+			die "Unable to send books to server: " . $res->status_line . "\n";
+		}
+	}
+}
