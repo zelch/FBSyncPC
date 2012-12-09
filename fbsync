@@ -40,8 +40,13 @@ my $state_db = DBI->connect("dbi:SQLite:dbname=$fbreader_dir/state.db", "", "", 
 
 my %local_books;
 
+STDOUT->autoflush(1);
+print "Getting local books: ";
 my $local_books = get_local_books();
+printf "%d done.\n", scalar keys(%$local_books);
+print "Getting remote books: ";
 my $remote_books = get_remote_books();
+printf "%d done.\n", scalar keys(%$remote_books);
 
 for my $key (keys(%$local_books)) {
 	next if (!exists($remote_books->{$key}));
@@ -97,7 +102,9 @@ for my $key (keys(%$local_books)) {
 }
 
 #print(Dumper($local_books));
+print "Sending remote books: ";
 send_remote_books($remote_books);
+printf "%d done.\n", scalar keys(%$remote_books);
 #print(Dumper($remote_books));
 
 sub get_account_key {
@@ -177,11 +184,9 @@ sub get_remote_books {
 
 sub update_book_local {
 	my ($book) = @_;
-	print "\nPushing from remote to local:\n";
-
 	my $rows = $state_db->do("update BookStateStack set paragraph = ?, word = ?, char = ? where book_id = ? and position = 0", {}, $book->{paragraph}, $book->{word}, $book->{char}, $book->{book_id}) or die $state_db->errstr;
 
-	print "Updated $rows records for '$book->{name}'\n";
+	print "Updated $rows local record(s) for '$book->{name}'\n";
 }
 
 sub to_remote {
@@ -229,7 +234,7 @@ sub send_remote_books {
 		$req->content('email=' . $conf{WEB}->{USER} . '&pin=' . $conf{WEB}->{PIN} . '&accountkey=' . $account_key . '&data=' . $data);
 		my $res = $ua->request($req);
 		if ($res->is_success) {
-			print "Successfully pushed books to server.\n";
+#			print "Successfully pushed books to server.\n";
 			print $res->content;
 		} else {
 			die "Unable to send books to server: " . $res->status_line . "\n";
