@@ -91,6 +91,10 @@ for my $key (keys(%$local_books)) {
 		$local->{char} = $remote->{char};
 		$local_updated = 1;
 	}
+	if ($local->{paragraph} == 0 && $local->{word} == 0 && $local->{char} == 0) {
+		delete($local_books->{$key});
+		next;
+	}
 
 	if ($local_updated) {
 		update_book_local($local);
